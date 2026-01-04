@@ -11,9 +11,15 @@
 	<groupId>com.datadistribution</groupId>
 	<artifactId>data-distribution-service</artifactId>
 	<version>0.0.1-SNAPSHOT</version>
-	<name>data-distribution-service</name>
+    <packaging>pom</packaging>
+    <name>data-distribution-service</name>
 	<description>Spring Boot service for distributing and serving high-volume data to downstream systems</description>
-	<scm>
+    <modules>
+        <module>distribution-core</module>
+        <module>distribution-api</module>
+        <module>distribution-worker</module>
+    </modules>
+    <scm>
 		<connection/>
 		<developerConnection/>
 		<tag/>
