@@ -1,0 +1,43 @@
+version: "3.9"
+
+services:
+
+  postgres:
+    image: postgres:16
+    container_name: data-distribution-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: data_distribution
+      POSTGRES_USER: data_dist_user
+      POSTGRES_PASSWORD: data_dist_password
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U data_dist_user -d data_distribution"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  activemq:
+    image: apache/activemq-classic
+    container_name: data-distribution-activemq
+    restart: unless-stopped
+    ports:
+      - "61616:61616"   # JMS (OpenWire)
+      - "8161:8161"     # Web Console
+    environment:
+      ACTIVEMQ_ADMIN_LOGIN: admin
+      ACTIVEMQ_ADMIN_PASSWORD: admin
+    volumes:
+      - activemq_data:/opt/apache-activemq/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8161"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  pg_data:
+  activemq_data:
