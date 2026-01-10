@@ -1,485 +1,576 @@
-# data-distribution-service
+# 📦 Data Distribution Service – Full Design (Authoritative, DB-only DLQ, Simplified S3 Paths)
 
-Async Export Pipeline (Queue + Worker + Postgres + S3)
+This document is the **single source of truth** for the Data Distribution Service design.  
+It reflects all decisions agreed so far, with **simplified S3 path handling** and **DB-only DLQ**.
 
-## 1. Problem statement
-
-High-frequency clients fetch large datasets by issuing many concurrent paginated API calls. This creates sustained DB pressure and limits overall stability.
-
-We replace that pattern with an asynchronous export job:
-
-- Client submits one request containing multiple keys and explicit effective dates per key.
-- The system creates a job and schedules independent work units (“chunks”) via a queue.
-- Workers process chunks in parallel (across containers and threads), call a non-paginated DB function, and write CSV files to S3.
-- The job completes only when every chunk has completed successfully.
-
-This pipeline is built to be correct under retries, safe under crashes, and bounded by DB limits.
+> **Design goals:** deterministic execution, crash safety, horizontal scalability, observability, and operational simplicity.
 
 ---
 
-## 2. Core concepts (strict definitions)
+## 1. System Overview
 
-### 2.1 Job
+Data Distribution Service is an asynchronous export platform that:
+- Accepts a batch of inputs in one job
+- Processes each input independently (one input → one output file)
+- Applies **retry with exponential backoff** on failures
+- Uses **DB-only DLQ** for terminal failures
+- Applies **fail-fast job semantics**: *any input in DLQ ⇒ job FAILED*
+- Supports configurable **file reuse** (flag + days)
 
-A job = one API submission.
-
-A job contains N chunks derived from the request body.
-
-### 2.2 Chunk
-
-A chunk = one (key, effectiveDate) pair.
-
-One chunk produces exactly:
-
-- One DB call
-- One output CSV file at a deterministic S3 path
-
-### 2.3 Deterministic output path
-
-Deterministic file paths are mandatory to prevent duplicates and enable reuse.
-
-File naming rule:
-
-- File name: `<KEY>_<YYYYMMDD>.csv`
-- Folder rule under base path: `YYYY/MM/DD/`
-
-Example:
-
-- base path: `s3://<bucket>/<basePath>/`
-- key = `ABC`, date = `20250215`
-- output key: `s3://<bucket>/<basePath>/2025/02/15/ABC_20250215.csv`
+The **database (Postgres)** is the source of truth and the primary work coordination mechanism.
 
 ---
 
-## 3. Components
+## 2. High-Level Architecture
 
-### 3.1 api-svc (Spring Boot)
+```
+Client
+  |
+  v
+[distribution-api]  (REST)
+  |
+  v
+PostgreSQL  (truth + coordination + recovery)
+  |
+  v
+[distribution-worker]  (poll + claim + execute)
+  |
+  +----> Amazon S3 (job-scoped output files)
+```
 
-Responsibilities:
-
-- Validate request
-- Create a job record
-- Expand request into chunk rows
-- Publish one queue message per chunk
-- Provide job status endpoint
-
-Non-responsibilities:
-
-- Does NOT call the export DB function
-- Does NOT generate files
-
-### 3.2 wrk-svc (Spring Boot)
-
-Responsibilities:
-
-- Consume queue messages
-- Ensure idempotency using DB claim+lease
-- Optionally reuse existing files
-- Call export DB function (non-paginated)
-- Stream results into CSV
-- Write file to deterministic S3 location
-- Mark chunk DONE/FAILED in DB
-
-### 3.3 mq (ActiveMQ queue)
-
-- Queue distributes chunks to competing consumers.
-- A message is delivered to only one consumer at a time.
-- Messages can be redelivered after failures (normal behavior).
-
-### 3.4 pg (Postgres)
-
-- System of record for job and chunk state.
-- Holds chunk statuses and retry counts.
-- (Optional) Holds file reuse cache.
-
-### 3.5 s3 (Object storage)
-
-- Stores output CSV files at deterministic paths.
-
-## 5. Queue contract
-
-### 5.1 Queue name
-
-- Work queue: `job.chunk.work`
-- Parking queue (DLQ-lite, recommended): `job.chunk.parking`
-
-### 5.2 Message payload (one message = one chunk)
+**Key principles**
+- Workers and API are **stateless**
+- All coordination is done via **DB leasing**
+- No message broker is required
 
 ---
 
-## 4. API contracts
+## 3. Maven Modules & Responsibilities
 
-### 4.1 Create job
+Repository root:
+```
+data-distribution-service
+ ├─ distribution-core
+ ├─ distribution-api
+ └─ distribution-worker
+```
 
-`POST /jobs`
+### 3.1 distribution-core
+Shared foundation used by API and Worker.
+- Domain enums
+- JPA entities
+- Repositories
+- State transition rules
+- Shared exceptions/constants
+
+### 3.2 distribution-api
+Spring Boot app.
+- `/jobs` submission
+- `/jobs/{jobId}` status
+- Flyway migrations
+
+### 3.3 distribution-worker
+Spring Boot app.
+- DB polling & atomic claiming
+- Input processing
+- Retry scheduling (`RETRY_WAIT` + `next_retry_at`)
+- DB-only DLQ handling
+- Fast-path job completion attempt
+- Finalizer job
+
+---
+
+## 4. API Contract
+
+### 4.1 POST /jobs
 
 **Request**
-
-json { "items": , "output": { "format": "CSV" } }
-
-**Validation rules (non-negotiable)**
-
-- `items` must be non-empty
-- For each item:
-  - `key` must be non-empty, trimmed
-  - `effectiveDates` must be non-empty
-  - each date must match `yyyyMMdd` and be a valid calendar date
-  - dedupe dates per key (reject or normalize; pick one policy and be consistent)
-- Enforce a safety guardrail:
-  - reject if total chunks > configured max (prevents accidental “million chunk” jobs)
-
-Big-tech standard: never trust clients to be reasonable. Guardrails are mandatory.
+```json
+{
+  "inputs": [
+    { "indexKey": "ABC", "effectiveDate": 20240202, "asofindicator": "CLS" },
+    { "indexKey": "DEF", "effectiveDate": 20230506, "asofindicator": "ADJCLS" }
+  ]
+}
+```
 
 **Response**
-
-HTTP `202 Accepted`
-
-json { "jobId": "J20260102_000123", "status": "SUBMITTED" }
-
-### 4.2 Get job status
-
-`GET /jobs/{jobId}`
-
-**Response (IN_PROGRESS)**
-
-json { "jobId": "J20260102_000123", "status": "IN_PROGRESS", "total": 4, "pending": 1, "running": 1, "done": 2, "failed": 0, "filesGenerated": 2, "filesReused": 0, "s3BasePath": "s3:/// /", "errorMessage": null }
-
-
-**Response (COMPLETED)**
-
-json { "jobId": "J20260102_000123", "status": "COMPLETED", "total": 4, "pending": 0, "running": 0, "done": 4, "failed": 0, "filesGenerated": 3, "filesReused": 1, "s3BasePath": "s3:/// /", "errorMessage": null }
-
-
-**Response (FAILED)**
-
-json { "jobId": "J20260102_000123", "status": "FAILED", "total": 4, "pending": 0, "running": 0, "done": 3, "failed": 1, "filesGenerated": 3, "filesReused": 0, "s3BasePath": "s3:/// /", "errorMessage": "Chunk failed after retries: key=ABC date=2025-03-15" }
-
+```json
+{ "jobId": "J20260110_000777", "status": "SUBMITTED" }
+```
 
 ---
 
-## 5. Queue contract
+### 4.2 GET /jobs/{jobId}
 
-### 5.1 Queue name
+**Purpose**: Poll job state and retrieve output file paths.
 
-- Work queue: `job.chunk.work`
-- Parking queue (DLQ-lite, recommended): `job.chunk.parking`
+**Response (COMPLETED example)**
+```json
+{
+  "jobId": "J20260110_000777",
+  "status": "COMPLETED",
+  "total": 2,
+  "pending": 0,
+  "running": 0,
+  "done": 2,
+  "failed": 0,
+  "filesGenerated": 1,
+  "filesReused": 1,
+  "errorMessage": null,
+  "dataContent": [
+    {
+      "indexKey": "ABC",
+      "effectiveDate": 20240202,
+      "asofindicator": "CLS",
+      "s3Path": "s3://bucket/exports/2026/01/10/J20260110_000777/ABC_20240202_CLS.csv"
+    },
+    {
+      "indexKey": "DEF",
+      "effectiveDate": 20230506,
+      "asofindicator": "ADJCLS",
+      "s3Path": "s3://bucket/exports/2025/12/20/J20251220_000123/DEF_20230506_ADJCLS.csv"
+    }
+  ]
+}
+```
 
-### 5.2 Message payload (one message = one chunk)
-json { "jobId": "J20260102_000123", "key": "ABC", "effectiveDate": "20250215" }
-
-
-### 5.3 Delivery guarantee (what you can and cannot assume)
-
-You can assume:
-
-- A message is delivered to only one consumer at a time.
-
-You cannot assume:
-
-- “Exactly once” processing.
-
-Redelivery after failure is expected. The system must be idempotent.
-
-## 6. S3 output layout (your required structure)
-
-### Base path (constant for all jobs)
-
-- Bucket and base path are constant across all outputs: `s3://<bucket>/<basePath>/`
-
-### Deterministic key template
-
-`<basePath>/<YYYY>/<MM>/<DD>/<KEY>_<YYYYMMDD>.csv`
-
-### Examples (basePath = `exports/`)
-
-- `exports/2025/02/15/ABC_20250215.csv`
-- `exports/2025/02/15/XYZ_20250215.csv`
-- `exports/2025/03/15/ABC_20250315.csv`
-
-This layout is not negotiable because it is the foundation of:
-
-- deduplication
-- file reuse
-- stable downstream access
+Notes:
+- **No `s3BasePath`** is returned
+- Each `dataContent[].s3Path` is an **absolute S3 location**
+- Reused files may point to **previous job folders**
 
 ---
 
-## 7. Database schema (tables + columns + why they exist)
+## 5. Database Schema
 
-### 7.1 `job`
+### 5.1 export_job
+```sql
+create table export_job (
+  job_id uuid primary key,
+  job_key text not null unique,
+  status text not null,
+  requested_at timestamptz default now(),
+  started_at timestamptz,
+  completed_at timestamptz,
+  total_inputs int not null,
+  error_message text
+);
+```
 
-One row per job.
+### 5.2 export_job_input
+```sql
+create table export_job_input (
+  input_id uuid primary key,
+  job_id uuid not null references export_job(job_id),
+  index_key text not null,
+  effective_date int not null,
+  asof_indicator text not null,
+  status text not null, -- PENDING, RUNNING, SUCCEEDED, RETRY_WAIT, DLQ
+  attempt_count int default 0,
+  next_retry_at timestamptz,
+  s3_path text,
+  is_reused boolean default false,
+  error_message text,
+  lease_owner text,
+  lease_until timestamptz,
+  unique(job_id, index_key, effective_date, asof_indicator)
+);
+```
 
-| column | type | why it exists |
-|---|---|---|
-| `job_id` (PK) | `varchar` | External identifier used by clients and workers |
-| `status` | `varchar` | `SUBMITTED` / `IN_PROGRESS` / `COMPLETED` / `FAILED` / `CANCELLED` |
-| `request_json` | `jsonb` | Audit/debug; needed to reproduce behavior |
-| `created_at` | `timestamptz` | Audit |
-| `updated_at` | `timestamptz` | Audit |
-| `s3_base_path` | `text` | Returned in status response; keeps environment-config visible |
-| `error_message` | `text` | Human-readable summary on `FAILED` |
+### 5.3 export_artifact (reuse registry)
+```sql
+create table export_artifact (
+  artifact_id uuid primary key,
+  index_key text not null,
+  effective_date int not null,
+  asof_indicator text not null,
+  s3_path text not null,
+  source_job_id uuid not null,
+  generated_at timestamptz default now(),
+  unique(index_key, effective_date, asof_indicator)
+);
+```
 
-Indexes:
+Purpose:
+- Tracks **latest usable file path** for reuse
+- Points to **actual job folder path** where file exists
 
-- (`status`)
-- (`created_at`)
+### 5.4 Indexes
+```sql
+-- export_job: for finalizer scans and status-based filtering
+create index if not exists ix_export_job_status on export_job(status);
+create index if not exists ix_export_job_requested_at on export_job(requested_at);
 
----
+-- export_job_input: for polling and leasing
+create index if not exists ix_input_job_id on export_job_input(job_id);
+create index if not exists ix_input_status on export_job_input(status);
 
-### 7.2 `job_chunk`
+-- critical for polling eligibility (PENDING / RETRY_WAIT due) + lease expiry
+create index if not exists ix_input_polling
+  on export_job_input(status, next_retry_at, lease_until);
 
-One row per (`jobId`, `key`, `effectiveDate`).
+-- optional but helpful when you frequently filter by lease_owner
+create index if not exists ix_input_lease_owner
+  on export_job_input(lease_owner);
 
-| column | type | why it exists |
-|---|---|---|
-| `job_id` | `varchar` | Groups chunks by job |
-| `chunk_key` | `varchar` | Deterministic unique id: `key=<K>:date=<YYYYMMDD>` |
-| `key` | `varchar` | Partition dimension for output naming |
-| `effective_date` | `date` | The date the export is for |
-| `status` | `varchar` | `PENDING` / `RUNNING` / `DONE` / `FAILED` |
-| `attempts` | `int` | Required for controlled retries |
-| `locked_at` | `timestamptz` | Lease timestamp for crash recovery |
-| `lock_owner` | `varchar` | Debugging: which worker owned it |
-| `started_at` | `timestamptz` | First time `RUNNING` happened |
-| `completed_at` | `timestamptz` | When `DONE`/`FAILED` |
-| `s3_object_key` | `text` | Actual output key (relative) |
-| `row_count` | `int` | Optional but useful for verification |
-| `reused` | `boolean` | Indicates whether we skipped DB and reused existing file |
-| `error_message` | `text` | Last error for failures |
+-- reuse registry lookup must be fast
+create unique index if not exists ux_artifact_key
+  on export_artifact(index_key, effective_date, asof_indicator);
 
-Constraints / indexes:
-
-- PK (recommended): (`job_id`, `chunk_key`)
-- index: (`job_id`, `status`)
-- index: (`key`, `effective_date`) (optional)
-
-Chunk statuses (only these four):
-
-- `PENDING`: created, not started
-- `RUNNING`: claimed by a worker
-- `DONE`: output available
-- `FAILED`: permanently failed after retries
-
----
-
-### 7.3 `file_cache` (optional but recommended for reuse)
-
-This table tracks generated files so that the system can decide whether a file can be reused or must be regenerated.
-
-| column | type | purpose |
-|---|---|---|
-| `key` | `varchar` | Part of uniqueness |
-| `effective_date` | `date` | Part of uniqueness |
-| `s3_object_key` | `text` | Deterministic S3 object path |
-| `row_count` | `int` | Number of rows written |
-| `created_at` | `timestamptz` | When the file was first generated |
-| `last_generated_at` | `timestamptz` | When the file was last regenerated |
-
-Unique constraint:
-
-- (`key`, `effective_date`)
-
-The `last_generated_at` column is used to support time-based regeneration logic.
-
-If a file is regenerated, the same deterministic S3 object key is overwritten and `last_generated_at` is updated.
-
-Critical note: If you don’t want reuse now, skip this table and skip reuse logic. But don’t partially implement reuse.
-
-The regeneration window (`reuseWindowDays`) must be configurable via application configuration (for example, YAML) and must not be hardcoded.
+-- optional: useful if you want to find newest artifacts
+create index if not exists ix_artifact_generated_at
+  on export_artifact(generated_at desc);
+```
 
 ---
 
-## 8. Reuse vs Regenerate Policy
+## 6. File Reuse Logic
 
-File reuse is conditional and governed by a time-based regeneration window.
+### 6.1 Configuration
+```yaml
+file:
+  reuse:
+    enabled: true
+    days: 7
+```
 
-Let:
+### 6.2 Decision flow
+```
+if reuse.enabled == false:
+    generate
+else if artifact not found:
+    generate
+else if effectiveDate > today - reuse.days:
+    generate
+else:
+    reuse
+```
 
-- `effectiveDate` be the date associated with the chunk
-- `currentDate` be the current date evaluated in a single consistent timezone (recommended: UTC)
-- `reuseWindowDays` be a configurable value (default: `7`)
+### 6.3 Behavior
+- **Generate**:
+    - Write file under current job folder
+    - Update `export_artifact` to point to this new path
+    - Mark input `SUCCEEDED`, `is_reused=false`
 
-Rules:
-
-- If `effectiveDate >= currentDate - reuseWindowDays`  
-  → the file must be regenerated, even if it already exists.
-- If `effectiveDate < currentDate - reuseWindowDays`  
-  → the file may be reused if an existing file is found.
-
-This policy ensures that recent data is always freshly generated, while older data benefits from reuse.
-
----
-
-## 9. Export DB function contract (required behavior)
-
-We will create a dedicated export function/procedure that:
-
-- disables pagination
-- returns all rows (10k–30k typical per chunk)
-- returns a row-set, not a JSON aggregation
-
-Recommended contract (conceptual):
-
-- input: (`key` `text`, `effective_date` `date`)
-- output: `TABLE(...)` row set
-
-Why row-set:
-
-- allows streaming to CSV
-- avoids DB JSON build overhead
-- avoids memory spikes
+- **Reuse**:
+    - Read path from `export_artifact`
+    - Mark input `SUCCEEDED`, `is_reused=true`
+    - No S3 write
 
 ---
 
-## 10. Worker processing: exact algorithm (idempotent + crash-safe)
+## 7. Worker Execution Flow
 
-### 10.1 Important: message consumption semantics
+```
+PENDING
+ → RUNNING
+   → SUCCEEDED (generated)
+   → SUCCEEDED (reused)
+   → FAILURE
+        → RETRY_WAIT
+        → RUNNING (retry)
+        → …
+        → DLQ
+```
 
-We use transactional consumption:
-
-- message is removed only after successful processing completes
-- on exception/crash → message redelivered
-
-This is required to avoid “lost work”.
-
-### 10.2 Steps per message
-
-Input message: (`jobId`, `key`, `effectiveDate`)
-
-**Step 0 – Job guard**  
-If the job status is `FAILED` or `CANCELLED`, acknowledge the message and return without processing.
-
-**Step 1 – Claim chunk (idempotency + lease)**
-sql UPDATE job_chunk SET status='RUNNING', locked_at=now(), attempts=attempts+1, lock_owner=:workerId, started_at=coalesce(started_at, now()) WHERE job_id=:jobId AND chunk_key=:chunkKey AND ;
-
-If no row is updated, the chunk is already owned or completed; acknowledge the message and return.
-
-**Step 2 – Decide reuse eligibility**  
-Before checking cache or object storage, determine whether reuse is allowed.
-
-- If the `effectiveDate` falls within the configured regeneration window, the file must be regenerated.
-- Otherwise, reuse may be attempted.
-
-This decision must be made before checking `file_cache` or S3.
-
-**Step 3 – Reuse or generate**
-
-- If reuse is allowed and a cache entry exists, mark the chunk as `DONE` with `reused=true`.
-- Otherwise, invoke the export DB function, stream results to CSV, and upload to the deterministic S3 path.
-
-**Step 4 – Update file cache**  
-After successful generation, update the cache entry. If a record already exists, it must be updated to reflect the latest generation time and metadata.
-
-**Step 5 – Mark chunk DONE**
-sql UPDATE job_chunk SET status='DONE', completed_at=now(), s3_object_key=:s3Key, row_count=:rowCount, reused=:reused WHERE job_id=:jobId AND chunk_key=:chunkKey;
-
-**Step 6 – Failure handling**
-
-- Retry processing up to the configured maximum attempts.
-- After retries are exhausted, mark the chunk as `FAILED`.
-
-If any chunk is marked `FAILED`, the overall job is considered failed.
+- `RETRY_WAIT` = scheduled retry
+- `DLQ` = terminal failure in DB
 
 ---
 
-## 11. Failure handling (what happens when things break)
+## 8. Job Completion
 
-### 11.1 Retriable failures
+### 8.1 Fast-path completion (worker)
+```sql
+update export_job
+set status = 'COMPLETED', completed_at = now()
+where job_id = :jobId
+  and not exists (
+    select 1 from export_job_input
+    where job_id = :jobId
+      and status in ('PENDING','RUNNING','RETRY_WAIT')
+  )
+  and not exists (
+    select 1 from export_job_input
+    where job_id = :jobId and status = 'DLQ'
+  );
+```
 
-Examples:
-
-- transient DB error
-- temporary network issue to S3
-- worker restart
-
-Policy:
-
-- allow up to `MAX_ATTEMPTS` (e.g., `5`)
-
-On exception:
-
-- update `error_message`
-- if `attempts < MAX_ATTEMPTS` → throw exception (message redelivered)
-- else mark `FAILED` and optionally publish to parking queue
-
-### 11.2 Stuck RUNNING recovery (“leaseExpired”)
-
-Problem:
-
-- worker can die after setting status `RUNNING`
-
-Solution:
-
-- `locked_at` acts as a lease
-- if `RUNNING` and `locked_at` older than lease duration → another worker can reclaim the chunk
-
-Lease duration must be >> worst-case chunk runtime.
+### 8.2 Finalizer
+- Periodic reconciliation
+- Ensures correctness under crashes or races
 
 ---
 
-## 12. Job completion rules
+## 9. Retry Policy
 
-### 12.1 Job status is derived from chunk rows
-
-Query:
-sql SELECT count(*) total, sum(case when status='PENDING' then 1 else 0 end) pending, sum(case when status='RUNNING' then 1 else 0 end) running, sum(case when status='DONE' then 1 else 0 end) done, sum(case when status='FAILED' then 1 else 0 end) failed, sum(case when reused=true then 1 else 0 end) reused_count FROM job_chunk WHERE job_id=:jobId;
-
-Rules:
-
-- if `failed > 0` → job `FAILED`
-- else if `done == total` → job `COMPLETED`
-- else → job `IN_PROGRESS`
-
-### 12.2 When do we update `job.status`?
-
-Two options:
-
-- compute on every `GET /jobs/{jobId}` (simple)
-- periodic finalizer (more consistent)
-
-We can start with “compute on GET” and add finalizer later.
+- Per-input retry
+- Exponential backoff (+ jitter recommended)
+- `RETRY_WAIT` controls eligibility
+- Retries do **not** fail job
 
 ---
 
-## 13. Threads + containers + queue: correctness guarantee (your concern)
+## 10. DB-only DLQ
 
-You can run:
-
-- multiple ECS tasks (containers)
-- each task with multiple listener threads
-
-All threads across all containers are competing consumers of the same queue.
-
-ActiveMQ queue guarantees:
-
-- a message is delivered to only one consumer at a time
-- if consumer fails before commit/ack, message will be redelivered later
-
-We guarantee correctness via:
-
-- DB claim step prevents two workers from processing same chunk concurrently
-- lease reclaim handles crashes
-- deterministic S3 key + unique cache prevents duplicate outputs
-
-So yes: threads within a container and across containers work together without discrepancies when you follow this pattern.
+- `export_job_input.status = 'DLQ'`
+- Any DLQ input ⇒ job FAILED
+- Re-drive possible by resetting status
 
 ---
 
-## 14. Critical implementation decisions (do not ignore)
+## 11. Main SQL Queries
 
-These will make or break production stability:
+Notes:
 
-1. Streaming output
-    - Never load 30k rows into memory and then write.
-    - Stream from JDBC to CSV.
-2. DB connection pool sizing
-    - If you run N concurrent consumers in one container, Hikari pool must support it.
-    - If pool < concurrency, threads block and throughput collapses.
-3. Retry policy
-    - Infinite retries are unacceptable.
-    - After `MAX_ATTEMPTS`, chunk becomes `FAILED`.
-4. Deterministic S3 keys
-    - If you allow random file names, you will create duplicates and cannot reuse.
-5. Guardrails on job size
-    - Must cap total chunks per request to protect the system.
+- Treat export_job_input as the unit of work (“chunk”).
+- Claim must be atomic; always check affected row count.
+- Keep claim/update queries in short transactions.
+
+### 1) Create Job
+```sql
+insert into export_job (
+  job_id, job_key, status, requested_at, total_inputs
+) values (
+  :jobId, :jobKey, 'SUBMITTED', now(), :totalInputs
+);
+```
+
+### 2) Insert Job Inputs (Chunks)
+```sql
+insert into export_job_input (
+  input_id, job_id, index_key, effective_date, asof_indicator,
+  status, attempt_count, is_reused
+) values (
+  :inputId, :jobId, :indexKey, :effectiveDate, :asofIndicator,
+  'PENDING', 0, false
+);
+```
+
+### 3) Candidate Selection (Polling) — IDs Only
+Select a small batch of eligible input IDs:
+```sql
+select i.input_id
+from export_job_input i
+join export_job j on j.job_id = i.job_id
+where j.status in ('SUBMITTED','RUNNING')
+  and (
+       i.status = 'PENDING'
+       or (i.status = 'RETRY_WAIT' and i.next_retry_at <= now())
+  )
+  and (i.lease_until is null or i.lease_until < now())
+order by j.requested_at asc, i.input_id asc
+limit :batchSize;
+```
+
+### 4) Atomic Claim (Lease + RUNNING)
+This is the safety gate. Only one worker will update 1 row.
+```sql
+update export_job_input
+set status = 'RUNNING',
+    lease_owner = :workerId,
+    lease_until = now() + (:leaseSeconds || ' seconds')::interval
+where input_id = :inputId
+  and (
+       status = 'PENDING'
+       or (status = 'RETRY_WAIT' and next_retry_at <= now())
+  )
+  and (lease_until is null or lease_until < now());
+```
+
+### 5) Mark Input Success (Generated)
+```sql
+update export_job_input
+set status = 'SUCCEEDED',
+    s3_path = :s3Path,
+    is_reused = false,
+    error_message = null,
+    lease_until = null
+where input_id = :inputId
+  and lease_owner = :workerId;
+```
+
+### 6) Mark Input Success (Reused)
+```sql
+update export_job_input
+set status = 'SUCCEEDED',
+    s3_path = :s3Path,
+    is_reused = true,
+    error_message = null,
+    lease_until = null
+where input_id = :inputId
+  and lease_owner = :workerId;
+```
+
+### 7) Schedule Retry (RETRY_WAIT)
+Use when error is retryable and attempts remain.
+```sql
+update export_job_input
+set status = 'RETRY_WAIT',
+    attempt_count = attempt_count + 1,
+    next_retry_at = :nextRetryAt,
+    error_message = :errorMessage,
+    lease_until = null
+where input_id = :inputId
+  and lease_owner = :workerId;
+```
+
+### 8) Move Input to DLQ (DB-only terminal failure)
+Use when retries exhausted or error is non-recoverable.
+```sql
+update export_job_input
+set status = 'DLQ',
+    attempt_count = attempt_count + 1,
+    error_message = :errorMessage,
+    lease_until = null
+where input_id = :inputId
+  and lease_owner = :workerId;
+```
+
+### 9) Fail Job Immediately (Fail-fast rule)
+Run after marking any input as DLQ.
+```sql
+update export_job
+set status = 'FAILED',
+    completed_at = now(),
+    error_message = :jobError
+where job_id = :jobId
+  and status not in ('FAILED','CANCELLED');
+```
+
+### Reuse / Artifact Queries
+### 10) Find Reusable Artifact (Lookup)
+This returns the latest known usable path (which may be from a previous job folder).
+```sql
+select a.s3_path, a.source_job_id, a.generated_at
+from export_artifact a
+where a.index_key = :indexKey
+  and a.effective_date = :effectiveDate
+  and a.asof_indicator = :asofIndicator;
+```
+Reuse decision is done in code using:
+- file.reuse.enabled
+- file.reuse.days
+- effectiveDate vs “today - reuseDays”
+
+
+### 11) Upsert Artifact After Generation
+When a file is newly generated (under current job folder), update the artifact registry.
+Postgres UPSERT:
+```sql
+insert into export_artifact (
+  artifact_id, index_key, effective_date, asof_indicator,
+  s3_path, source_job_id, generated_at
+) values (
+  :artifactId, :indexKey, :effectiveDate, :asofIndicator,
+  :s3Path, :jobId, now()
+)
+on conflict (index_key, effective_date, asof_indicator)
+do update set
+  s3_path = excluded.s3_path,
+  source_job_id = excluded.source_job_id,
+  generated_at = excluded.generated_at;
+```
+
+### Job Completion Queries
+### 12) Worker Fast-path Completion Attempt
+Worker tries to complete the job right after finishing an input.
+```sql
+update export_job
+set status = 'COMPLETED',
+    completed_at = now()
+where job_id = :jobId
+  and status in ('SUBMITTED','RUNNING')
+  and not exists (
+    select 1
+    from export_job_input
+    where job_id = :jobId
+      and status in ('PENDING','RUNNING','RETRY_WAIT')
+  )
+  and not exists (
+    select 1
+    from export_job_input
+    where job_id = :jobId
+      and status = 'DLQ'
+  );
+```
+✅ Treat as best-effort; finalizer remains authoritative.
+
+
+### 13) Finalizer — Mark FAILED First
+```sql
+update export_job j
+set status = 'FAILED',
+    completed_at = now(),
+    error_message = 'One or more inputs moved to DLQ'
+where j.status in ('SUBMITTED','RUNNING')
+  and exists (
+    select 1
+    from export_job_input i
+    where i.job_id = j.job_id
+      and i.status = 'DLQ'
+  );
+```
+
+### 14) Finalizer — Mark COMPLETED
+```sql
+update export_job j
+set status = 'COMPLETED',
+    completed_at = now()
+where j.status in ('SUBMITTED','RUNNING')
+  and not exists (
+    select 1
+    from export_job_input i
+    where i.job_id = j.job_id
+      and i.status in ('PENDING','RUNNING','RETRY_WAIT')
+  )
+  and not exists (
+    select 1
+    from export_job_input i
+    where i.job_id = j.job_id
+      and i.status = 'DLQ'
+  );
+```
+
+### Optional Operational Queries (Support)
+### 15) Job Summary Counts (for /jobs/{jobId} response)
+```sql
+select
+  count(*) as total,
+  count(*) filter (where status = 'PENDING') as pending,
+  count(*) filter (where status = 'RUNNING') as running,
+  count(*) filter (where status = 'SUCCEEDED') as done,
+  count(*) filter (where status = 'DLQ') as failed,
+  count(*) filter (where status = 'SUCCEEDED' and is_reused = false) as files_generated,
+  count(*) filter (where status = 'SUCCEEDED' and is_reused = true)  as files_reused
+from export_job_input
+where job_id = :jobId;
+```
+
+
+
+## 12. Configuration Knobs
+
+- worker.poll.batchSize
+- worker.lease.seconds
+- retry.maxAttempts
+- retry.baseDelayMs
+- file.reuse.enabled
+- file.reuse.days
+- finalizer.intervalMs
+
+---
+
+## 13. Guarantees
+
+✔ Simplified S3 paths  
+✔ Deterministic reuse  
+✔ DB-only DLQ  
+✔ Retry-safe & crash-safe  
+✔ ECS-ready scaling
+
+---
+
+**End of Document**
+
